@@ -124,6 +124,8 @@ int main()
 
 cudaError_t SolveGPU(Point* h_points, int size, int k)
 {
+	std::clock_t c_start, c_end;
+	double time_elapsed_ms;
 	cudaError_t cudaStatus;
 
 	Point* d_points;
@@ -272,6 +274,7 @@ cudaError_t SolveGPU(Point* h_points, int size, int k)
 
 	while (true)
 	{
+		c_start = std::clock();
 		FindCluster<<<nBlocks, 1024>>>(d_points, d_clusters, d_result, d_delta, d_k, d_size);
 			cudaStatus = cudaGetLastError();
 			if (cudaStatus != cudaSuccess) {
@@ -284,6 +287,10 @@ cudaError_t SolveGPU(Point* h_points, int size, int k)
 				goto Error;
 			}
 
+			c_end = std::clock();
+			time_elapsed_ms = 1000.0 * (c_end - c_start) / CLOCKS_PER_SEC;
+			printf("Time for FindCluster: %lf ms\n", time_elapsed_ms);
+			std::cout << std::endl;
 		thrust::device_ptr<int> dev_clusters_ptr(d_clusters);
 		thrust::device_ptr<int> dev_clusters_copy_ptr(d_clusters_copy);
 		thrust::device_ptr<int> dev_reduce_count_keys_ptr(d_reduce_count_keys);
@@ -294,18 +301,47 @@ cudaError_t SolveGPU(Point* h_points, int size, int k)
 		thrust::device_ptr<Point> dev_reduce_result_values_ptr(d_reduce_result_values);
 		thrust::device_ptr<int> dev_delta_ptr(d_delta);
 
+		c_start = std::clock();
 		thrust::copy(thrust::device, dev_clusters_ptr, dev_clusters_ptr + size, dev_clusters_copy_ptr);
 		thrust::copy(thrust::device, dev_points_ptr, dev_points_ptr + size, dev_points_copy_ptr);
 
+		c_end = std::clock();
+		time_elapsed_ms = 1000.0 * (c_end - c_start) / CLOCKS_PER_SEC;
+		printf("Time for copies: %lf ms\n", time_elapsed_ms);
+		std::cout << std::endl;
+
+		c_start = std::clock();
 		thrust::sort_by_key(thrust::device, dev_clusters_copy_ptr, dev_clusters_copy_ptr + size, dev_points_copy_ptr);
+		c_end = std::clock();
+		time_elapsed_ms = 1000.0 * (c_end - c_start) / CLOCKS_PER_SEC;
+		printf("Time for sort 1.1: %lf ms\n", time_elapsed_ms);
+		c_start = std::clock();
 		thrust::reduce_by_key(thrust::device, dev_clusters_copy_ptr, dev_clusters_copy_ptr + size, thrust::make_constant_iterator(1), 
 			dev_reduce_count_keys_ptr, dev_reduce_count_values_ptr);
+		c_end = std::clock();
+		time_elapsed_ms = 1000.0 * (c_end - c_start) / CLOCKS_PER_SEC;
+		printf("Time for reduce 1.1: %lf ms\n", time_elapsed_ms);
+		c_start = std::clock();
 		thrust::sort_by_key(thrust::device, dev_reduce_count_keys_ptr, dev_reduce_count_keys_ptr + k, dev_reduce_count_values_ptr);
+		c_end = std::clock();
+		time_elapsed_ms = 1000.0 * (c_end - c_start) / CLOCKS_PER_SEC;
+		printf("Time for sort 1.2: %lf ms\n", time_elapsed_ms);
+		std::cout << std::endl;
 
+		c_start = std::clock();
 		thrust::reduce_by_key(thrust::device, dev_clusters_copy_ptr, dev_clusters_copy_ptr + size, dev_points_copy_ptr, 
 			dev_reduce_result_keys_ptr, dev_reduce_result_values_ptr, thrust::equal_to<int>(), SumPoints());
+		c_end = std::clock();
+		time_elapsed_ms = 1000.0 * (c_end - c_start) / CLOCKS_PER_SEC;
+		printf("Time for reduce 2.1: %lf ms\n", time_elapsed_ms);
+		c_start = std::clock();
 		thrust::sort_by_key(thrust::device, dev_reduce_result_keys_ptr, dev_reduce_result_keys_ptr + k, dev_reduce_result_values_ptr);
+		c_end = std::clock();
+		time_elapsed_ms = 1000.0 * (c_end - c_start) / CLOCKS_PER_SEC;
+		printf("Time for sort 2.1: %lf ms\n", time_elapsed_ms);
+		std::cout << std::endl;
 
+		c_start = std::clock();
 		CalculateResult<<<kBlocks,1024>>>(d_reduce_result_values, d_reduce_count_values, d_result, d_k);
 			cudaStatus = cudaGetLastError();
 			if (cudaStatus != cudaSuccess) {
@@ -317,8 +353,18 @@ cudaError_t SolveGPU(Point* h_points, int size, int k)
 				fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching CalculateResult!\n", cudaStatus);
 				goto Error;
 			}
+			c_end = std::clock();
+			time_elapsed_ms = 1000.0 * (c_end - c_start) / CLOCKS_PER_SEC;
+			printf("Time for CalculateResult: %lf ms\n", time_elapsed_ms);
+			std::cout << std::endl;
 
+		c_start = std::clock();
 		int delta = thrust::reduce(thrust::device, dev_delta_ptr, dev_delta_ptr + size);
+		c_end = std::clock();
+		time_elapsed_ms = 1000.0 * (c_end - c_start) / CLOCKS_PER_SEC;
+		printf("Time for delta reduce: %lf ms\n", time_elapsed_ms);
+
+		std::cout << std::endl;
 		std::cout << "Iteration: "<< iteration++ << ", delta: " << delta << std::endl;
 		if (delta == 0)
 			break;
