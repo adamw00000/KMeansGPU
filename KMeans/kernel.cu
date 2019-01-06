@@ -10,6 +10,7 @@
 #include <thrust/execution_policy.h>
 
 #define POINTS_PER_THREAD 32
+//#define TIMERS 1
 
 struct SumPoints: public thrust::binary_function<Point, Point, Point>
 {
@@ -156,6 +157,10 @@ int main()
 cudaError_t SolveGPU(Point* h_points, int size, int k)
 {
 	cudaError_t cudaStatus;
+#ifdef TIMERS
+	std::clock_t c_start, c_end;
+	double time_elapsed_ms;
+#endif
 
 	Point* d_points;
 	int* h_clusters;
@@ -290,6 +295,9 @@ cudaError_t SolveGPU(Point* h_points, int size, int k)
 
 	while (true)
 	{
+#ifdef TIMERS
+		c_start = std::clock();
+#endif
 		Reset<<<kBlocks, nThreads>>>(d_new_result_final, d_counts_final, d_k);
 			cudaStatus = cudaGetLastError();
 			if (cudaStatus != cudaSuccess) {
@@ -302,6 +310,12 @@ cudaError_t SolveGPU(Point* h_points, int size, int k)
 				goto Error;
 			}
 
+#ifdef TIMERS
+			c_end = std::clock();
+			time_elapsed_ms = 1000.0 * (c_end - c_start) / CLOCKS_PER_SEC;
+			printf("Time for Reset: %lf ms\n", time_elapsed_ms);
+			c_start = std::clock();
+#endif
 		FindCluster<<<nBlocks, nThreads>>>(d_points, d_clusters, d_result, d_new_result, d_counts, d_delta, d_k, d_size, nBlocks * nThreads);
 			cudaStatus = cudaGetLastError();
 			if (cudaStatus != cudaSuccess) {
@@ -313,6 +327,12 @@ cudaError_t SolveGPU(Point* h_points, int size, int k)
 				fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching FindCluster!\n", cudaStatus);
 				goto Error;
 			}
+#ifdef TIMERS
+			c_end = std::clock();
+			time_elapsed_ms = 1000.0 * (c_end - c_start) / CLOCKS_PER_SEC;
+			printf("Time for FindCluster: %lf ms\n", time_elapsed_ms);
+			c_start = std::clock();
+#endif
 
 		for (int i = 0; i < k; i++)
 		{
@@ -324,8 +344,12 @@ cudaError_t SolveGPU(Point* h_points, int size, int k)
 			dev_new_result_final_ptr[i] = thrust::reduce(dev_new_result_ptr, dev_new_result_ptr + nThreads * nBlocks, Point(), SumPoints());
 			dev_count_final_ptr[i] = thrust::reduce(dev_count_ptr, dev_count_ptr + nThreads * nBlocks);
 		}
-
-		thrust::device_ptr<int> dev_delta_ptr(d_delta);
+#ifdef TIMERS
+		c_end = std::clock();
+		time_elapsed_ms = 1000.0 * (c_end - c_start) / CLOCKS_PER_SEC;
+		printf("Time for reduces: %lf ms\n", time_elapsed_ms);
+		c_start = std::clock();
+#endif
 
 		CalculateResult<<<kBlocks, nThreads>>>(d_new_result_final, d_counts_final, d_result, d_k);
 			cudaStatus = cudaGetLastError();
@@ -338,8 +362,21 @@ cudaError_t SolveGPU(Point* h_points, int size, int k)
 				fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching CalculateResult!\n", cudaStatus);
 				goto Error;
 			}
+#ifdef TIMERS
+			c_end = std::clock();
+			time_elapsed_ms = 1000.0 * (c_end - c_start) / CLOCKS_PER_SEC;
+			printf("Time for CalculateResult: %lf ms\n", time_elapsed_ms);
+			c_start = std::clock();
+#endif
 
+		thrust::device_ptr<int> dev_delta_ptr(d_delta);
 		int delta = thrust::reduce(thrust::device, dev_delta_ptr, dev_delta_ptr + size);
+
+#ifdef TIMERS
+		c_end = std::clock();
+		time_elapsed_ms = 1000.0 * (c_end - c_start) / CLOCKS_PER_SEC;
+		printf("Time for delta: %lf ms\n", time_elapsed_ms);
+#endif
 		std::cout << "Iteration: "<< iteration++ << ", delta: " << delta << std::endl;
 		if (delta == 0)
 			break;
