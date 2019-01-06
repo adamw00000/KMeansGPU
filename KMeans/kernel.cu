@@ -9,6 +9,8 @@
 #include <thrust/sort.h>
 #include <thrust/execution_policy.h>
 
+#define POINTS_PER_THREAD 32
+
 struct SumPoints: public thrust::binary_function<Point, Point, Point>
 {
 	__host__ __device__ Point operator()(Point p1, Point p2) { return Point(p1.X + p2.X, p1.Y + p2.Y, p1.Z + p2.Z); }
@@ -19,39 +21,7 @@ __device__ double PointDistance(const Point& p1, const Point& p2)
 	return sqrt((p1.X - p2.X) * (p1.X - p2.X) + (p1.Y - p2.Y) * (p1.Y - p2.Y) + (p1.Z - p2.Z) * (p1.Z - p2.Z));
 }
 
-__global__ void FindCluster(Point* d_points, int* d_clusters, Point* d_result, int* d_delta, int* d_k, int* d_size)
-{
-	int k = *d_k;
-	int size = *d_size;
-	int i = blockIdx.x * blockDim.x + threadIdx.x;
-
-	if (i >= size)
-		return;
-
-	double minDist = DBL_MAX;
-	int bestCluster = -1; 
-	d_delta[i] = 0;
-
-	for (int j = 0; j < k; j++)
-	{
-		int dist = PointDistance(d_points[i], d_result[j]);
-		if (dist < minDist)
-		{
-			minDist = dist;
-			bestCluster = j;
-		}
-	}
-
-	//printf("Thread: %d, old cluster: %d, new cluster: %d\n", i, d_clusters[i], bestCluster);
-
-	if (bestCluster != d_clusters[i])
-	{
-		d_clusters[i] = bestCluster;
-		d_delta[i] = 1;
-	}
-}
-
-__global__ void CalculateResult(Point* d_reduce_result_values, int* d_reduce_count_values, Point* d_result, int* d_k)
+__global__ void Reset(Point* d_new_result, int* d_counts, int* d_k)
 {
 	int k = *d_k;
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -59,8 +29,69 @@ __global__ void CalculateResult(Point* d_reduce_result_values, int* d_reduce_cou
 	if (i >= k)
 		return;
 
-	Point p = d_reduce_result_values[i];
-	int count = d_reduce_count_values[i];
+	d_counts[i] = 0;
+	d_new_result[i] = Point();
+}
+
+__global__ void FindCluster(Point* d_points, int* d_clusters, Point* d_result, Point* d_new_result, int* d_counts, int* d_delta, int* d_k, int* d_size, int threads)
+{
+	int k = *d_k;
+	int size = *d_size;
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+	for (int cluster = 0; cluster < k; cluster++)
+	{
+		d_new_result[cluster * threads + i] = Point();
+		d_counts[cluster * threads + i] = 0;
+	}
+
+	for (int pointNr = 0; pointNr < POINTS_PER_THREAD; pointNr++)
+	{
+		int index = i * POINTS_PER_THREAD + pointNr;
+
+		if (index >= size)
+			return;
+
+		double minDist = DBL_MAX;
+		int bestCluster = -1;
+		d_delta[index] = 0;
+
+		Point p = d_points[index];
+
+		for (int j = 0; j < k; j++)
+		{
+			int dist = PointDistance(p, d_result[j]);
+			if (dist < minDist)
+			{
+				minDist = dist;
+				bestCluster = j;
+			}
+		}
+
+		//printf("Index: %d, old cluster: %d, new cluster: %d\n", index, d_clusters[index], bestCluster);
+
+		if (bestCluster != d_clusters[index])
+		{
+			d_clusters[index] = bestCluster;
+			d_delta[index] = 1;
+		}
+
+		Point oldNewResult = d_new_result[bestCluster * threads + i];
+		d_new_result[bestCluster * threads + i] = Point(oldNewResult.X + p.X, oldNewResult.Y + p.Y, oldNewResult.Z + p.Z);
+		d_counts[bestCluster * threads + i]++;
+	}
+}
+
+__global__ void CalculateResult(Point* d_new_result, int* d_counts, Point* d_result, int* d_k)
+{
+	int k = *d_k;
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+	if (i >= k)
+		return;
+
+	Point p = d_new_result[i];
+	int count = d_counts[i];
 
 	d_result[i] = Point(p.X / count, p.Y / count, p.Z / count);
 }
@@ -71,19 +102,19 @@ int main()
 {
 	std::clock_t c_start, c_end;
 	double time_elapsed_ms;
+/*
+	int size = 3;
+	int k = 2;
 
-	//int size = 3;
-	//int k = 2;
-
-	//Point* points = new Point[size];
-	//points[0] = Point(10, 10, 10);
-	//points[1] = Point(10, 20, 10);
-	//points[2] = Point(20, 10, 10);
+	Point* points = new Point[size];
+	points[0] = Point(10, 10, 10);
+	points[1] = Point(10, 20, 10);
+	points[2] = Point(20, 10, 10);*/
 
 
 	srand(time(NULL));
 	int size = 1000000;
-	int k = 2;
+	int k = 10;
 
 	Point* points = new Point[size];
 	for (int i = 0; i < size; i++)
@@ -124,8 +155,6 @@ int main()
 
 cudaError_t SolveGPU(Point* h_points, int size, int k)
 {
-	std::clock_t c_start, c_end;
-	double time_elapsed_ms;
 	cudaError_t cudaStatus;
 
 	Point* d_points;
@@ -134,15 +163,20 @@ cudaError_t SolveGPU(Point* h_points, int size, int k)
 	int* d_clusters_copy;
 	Point* h_result;
 	Point* d_result;
+	Point* d_new_result;
+	Point* d_new_result_final;
+	int* d_counts;
+	int* d_counts_final;
 	int* d_k;
 	int* d_size;
 	int* d_delta;
-	int* d_reduce_count_keys;
-	int* d_reduce_count_values;
-	int* d_reduce_result_keys;
-	Point* d_reduce_result_values;
-	Point* d_new_result;
-	Point* d_points_copy;
+
+	int nThreads = 128;
+	int nBlocks = size / POINTS_PER_THREAD / nThreads;
+	nBlocks += (size % nThreads == 0) ? 0 : 1;
+	int kBlocks = k / nThreads;
+	kBlocks += (k % nThreads == 0) ? 0 : 1;
+	int iteration = 0;
 
 	h_clusters = new int[size];
 	h_result = new Point[k];
@@ -230,52 +264,45 @@ cudaError_t SolveGPU(Point* h_points, int size, int k)
 		goto Error;
 	}
 
-	cudaStatus = cudaMalloc((void**)&d_reduce_count_keys, k * sizeof(int));
+	cudaStatus = cudaMalloc((void**)&d_new_result, nThreads * nBlocks * k * sizeof(Point));
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "cudaMalloc failed!");
 		goto Error;
 	}
 
-	cudaStatus = cudaMalloc((void**)&d_reduce_count_values, k * sizeof(int));
+	cudaStatus = cudaMalloc((void**)&d_new_result_final, k * sizeof(Point));
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "cudaMalloc failed!");
 		goto Error;
 	}
 
-	cudaStatus = cudaMalloc((void**)&d_reduce_result_keys, k * sizeof(int));
+	cudaStatus = cudaMalloc((void**)&d_counts, nThreads * nBlocks * k * sizeof(int));
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "cudaMalloc failed!");
 		goto Error;
 	}
 
-	cudaStatus = cudaMalloc((void**)&d_reduce_result_values, k * sizeof(Point));
+	cudaStatus = cudaMalloc((void**)&d_counts_final, k * sizeof(int));
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "cudaMalloc failed!");
 		goto Error;
 	}
-
-	cudaStatus = cudaMalloc((void**)&d_new_result, k * sizeof(Point));
-	if (cudaStatus != cudaSuccess) {
-		fprintf(stderr, "cudaMalloc failed!");
-		goto Error;
-	}
-
-	cudaStatus = cudaMalloc((void**)&d_points_copy, size * sizeof(Point));
-	if (cudaStatus != cudaSuccess) {
-		fprintf(stderr, "cudaMalloc failed!");
-		goto Error;
-	}
-
-	int nBlocks = size / 1024;
-	nBlocks += (size % 1024 == 0) ? 0 : 1;
-	int kBlocks = k / 1024;
-	kBlocks += (k % 1024 == 0) ? 0 : 1;
-	int iteration = 0;
 
 	while (true)
 	{
-		c_start = std::clock();
-		FindCluster<<<nBlocks, 1024>>>(d_points, d_clusters, d_result, d_delta, d_k, d_size);
+		Reset<<<kBlocks, nThreads>>>(d_new_result_final, d_counts_final, d_k);
+			cudaStatus = cudaGetLastError();
+			if (cudaStatus != cudaSuccess) {
+				fprintf(stderr, "ResetCounts launch failed: %s\n", cudaGetErrorString(cudaStatus));
+				goto Error;
+			}
+			cudaStatus = cudaDeviceSynchronize();
+			if (cudaStatus != cudaSuccess) {
+				fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching ResetCounts!\n", cudaStatus);
+				goto Error;
+			}
+
+		FindCluster<<<nBlocks, nThreads>>>(d_points, d_clusters, d_result, d_new_result, d_counts, d_delta, d_k, d_size, nBlocks * nThreads);
 			cudaStatus = cudaGetLastError();
 			if (cudaStatus != cudaSuccess) {
 				fprintf(stderr, "FindCluster launch failed: %s\n", cudaGetErrorString(cudaStatus));
@@ -287,62 +314,20 @@ cudaError_t SolveGPU(Point* h_points, int size, int k)
 				goto Error;
 			}
 
-			c_end = std::clock();
-			time_elapsed_ms = 1000.0 * (c_end - c_start) / CLOCKS_PER_SEC;
-			printf("Time for FindCluster: %lf ms\n", time_elapsed_ms);
-			std::cout << std::endl;
-		thrust::device_ptr<int> dev_clusters_ptr(d_clusters);
-		thrust::device_ptr<int> dev_clusters_copy_ptr(d_clusters_copy);
-		thrust::device_ptr<int> dev_reduce_count_keys_ptr(d_reduce_count_keys);
-		thrust::device_ptr<int> dev_reduce_count_values_ptr(d_reduce_count_values);
-		thrust::device_ptr<Point> dev_points_ptr(d_points);
-		thrust::device_ptr<Point> dev_points_copy_ptr(d_points_copy);
-		thrust::device_ptr<int> dev_reduce_result_keys_ptr(d_reduce_result_keys);
-		thrust::device_ptr<Point> dev_reduce_result_values_ptr(d_reduce_result_values);
+		for (int i = 0; i < k; i++)
+		{
+			thrust::device_ptr<Point> dev_new_result_ptr(d_new_result + i * nBlocks * nThreads);
+			thrust::device_ptr<int> dev_count_ptr(d_counts + i * nBlocks * nThreads);
+			thrust::device_ptr<Point> dev_new_result_final_ptr(d_new_result_final);
+			thrust::device_ptr<int> dev_count_final_ptr(d_counts_final);
+
+			dev_new_result_final_ptr[i] = thrust::reduce(dev_new_result_ptr, dev_new_result_ptr + nThreads * nBlocks, Point(), SumPoints());
+			dev_count_final_ptr[i] = thrust::reduce(dev_count_ptr, dev_count_ptr + nThreads * nBlocks);
+		}
+
 		thrust::device_ptr<int> dev_delta_ptr(d_delta);
 
-		c_start = std::clock();
-		thrust::copy(thrust::device, dev_clusters_ptr, dev_clusters_ptr + size, dev_clusters_copy_ptr);
-		thrust::copy(thrust::device, dev_points_ptr, dev_points_ptr + size, dev_points_copy_ptr);
-
-		c_end = std::clock();
-		time_elapsed_ms = 1000.0 * (c_end - c_start) / CLOCKS_PER_SEC;
-		printf("Time for copies: %lf ms\n", time_elapsed_ms);
-		std::cout << std::endl;
-
-		c_start = std::clock();
-		thrust::sort_by_key(thrust::device, dev_clusters_copy_ptr, dev_clusters_copy_ptr + size, dev_points_copy_ptr);
-		c_end = std::clock();
-		time_elapsed_ms = 1000.0 * (c_end - c_start) / CLOCKS_PER_SEC;
-		printf("Time for sort 1.1: %lf ms\n", time_elapsed_ms);
-		c_start = std::clock();
-		thrust::reduce_by_key(thrust::device, dev_clusters_copy_ptr, dev_clusters_copy_ptr + size, thrust::make_constant_iterator(1), 
-			dev_reduce_count_keys_ptr, dev_reduce_count_values_ptr);
-		c_end = std::clock();
-		time_elapsed_ms = 1000.0 * (c_end - c_start) / CLOCKS_PER_SEC;
-		printf("Time for reduce 1.1: %lf ms\n", time_elapsed_ms);
-		c_start = std::clock();
-		thrust::sort_by_key(thrust::device, dev_reduce_count_keys_ptr, dev_reduce_count_keys_ptr + k, dev_reduce_count_values_ptr);
-		c_end = std::clock();
-		time_elapsed_ms = 1000.0 * (c_end - c_start) / CLOCKS_PER_SEC;
-		printf("Time for sort 1.2: %lf ms\n", time_elapsed_ms);
-		std::cout << std::endl;
-
-		c_start = std::clock();
-		thrust::reduce_by_key(thrust::device, dev_clusters_copy_ptr, dev_clusters_copy_ptr + size, dev_points_copy_ptr, 
-			dev_reduce_result_keys_ptr, dev_reduce_result_values_ptr, thrust::equal_to<int>(), SumPoints());
-		c_end = std::clock();
-		time_elapsed_ms = 1000.0 * (c_end - c_start) / CLOCKS_PER_SEC;
-		printf("Time for reduce 2.1: %lf ms\n", time_elapsed_ms);
-		c_start = std::clock();
-		thrust::sort_by_key(thrust::device, dev_reduce_result_keys_ptr, dev_reduce_result_keys_ptr + k, dev_reduce_result_values_ptr);
-		c_end = std::clock();
-		time_elapsed_ms = 1000.0 * (c_end - c_start) / CLOCKS_PER_SEC;
-		printf("Time for sort 2.1: %lf ms\n", time_elapsed_ms);
-		std::cout << std::endl;
-
-		c_start = std::clock();
-		CalculateResult<<<kBlocks,1024>>>(d_reduce_result_values, d_reduce_count_values, d_result, d_k);
+		CalculateResult<<<kBlocks, nThreads>>>(d_new_result_final, d_counts_final, d_result, d_k);
 			cudaStatus = cudaGetLastError();
 			if (cudaStatus != cudaSuccess) {
 				fprintf(stderr, "CalculateResult launch failed: %s\n", cudaGetErrorString(cudaStatus));
@@ -353,18 +338,8 @@ cudaError_t SolveGPU(Point* h_points, int size, int k)
 				fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching CalculateResult!\n", cudaStatus);
 				goto Error;
 			}
-			c_end = std::clock();
-			time_elapsed_ms = 1000.0 * (c_end - c_start) / CLOCKS_PER_SEC;
-			printf("Time for CalculateResult: %lf ms\n", time_elapsed_ms);
-			std::cout << std::endl;
 
-		c_start = std::clock();
 		int delta = thrust::reduce(thrust::device, dev_delta_ptr, dev_delta_ptr + size);
-		c_end = std::clock();
-		time_elapsed_ms = 1000.0 * (c_end - c_start) / CLOCKS_PER_SEC;
-		printf("Time for delta reduce: %lf ms\n", time_elapsed_ms);
-
-		std::cout << std::endl;
 		std::cout << "Iteration: "<< iteration++ << ", delta: " << delta << std::endl;
 		if (delta == 0)
 			break;
