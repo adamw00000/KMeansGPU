@@ -43,7 +43,7 @@ public:
 
 	friend Point operator*(const double & a, const Point & p1)
 	{
-		return operator*(a, p1);
+		return Point(p1.X * a, p1.Y * a, p1.Z * a);
 	}
 
 	friend Point operator/(const Point & p1, const double & a)
