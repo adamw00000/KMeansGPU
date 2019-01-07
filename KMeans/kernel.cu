@@ -284,7 +284,8 @@ int main(int argc, char** argv)
 	}
 	else
 	{
-		fprintf(stderr, "Invalid arguments");
+		fprintf(stderr, "Invalid arguments\n");
+		return EXIT_FAILURE;
 	}
 
 	Point* points = new Point[size];
