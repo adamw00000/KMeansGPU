@@ -255,23 +255,37 @@ __global__ void CalculateResult(Point* d_new_result, int* d_counts, Point* d_res
 
 cudaError_t SolveGPU(Point* points, int size, int k);
 
-int main()
+int main(int argc, char** argv)
 {
 	std::clock_t c_start, c_end;
 	double time_elapsed_ms;
-/*
-	int size = 3;
-	int k = 2;
-
-	Point* points = new Point[size];
-	points[0] = Point(10, 10, 10);
-	points[1] = Point(10, 20, 10);
-	points[2] = Point(20, 10, 10);*/
-
+	int size;
+	int k;
 
 	srand(time(NULL));
-	int size = 1000000;
-	int k = 10;
+
+	if (argc == 1)
+	{
+		size = 1000000;
+		k = 10;
+		/*
+		int size = 3;
+		int k = 2;
+
+		Point* points = new Point[size];
+		points[0] = Point(10, 10, 10);
+		points[1] = Point(10, 20, 10);
+		points[2] = Point(20, 10, 10);*/
+	}
+	else if (argc == 3)
+	{
+		size = atoi(argv[1]);
+		k = atoi(argv[2]);
+	}
+	else
+	{
+		fprintf(stderr, "Invalid arguments");
+	}
 
 	Point* points = new Point[size];
 	for (int i = 0; i < size; i++)
