@@ -1,16 +1,172 @@
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
-#include "Point.h"
-#include "KMeansCPU.h"
 
 #include <stdio.h>
 #include <ctime>
 #include <thrust/device_vector.h>
 #include <thrust/sort.h>
 #include <thrust/execution_policy.h>
+#include <iostream>
+#include <float.h>
 
 #define POINTS_PER_THREAD 32
 //#define TIMERS 1
+
+class Point
+{
+public:
+	double X, Y, Z;
+
+	__host__ __device__ Point() : X(0), Y(0), Z(0) {}
+	__host__ __device__ Point(double x, double y, double z) : X(x), Y(y), Z(z) {}
+
+	friend std::ostream & operator<<(std::ostream & ostream, const Point& p)
+	{
+		ostream << "(" << p.X << ", " << p.Y << ", " << p.Z << ")";
+		return ostream;
+	}
+
+	friend Point operator+(const Point & p1, const Point & p2)
+	{
+		return Point(p1.X + p2.X, p1.Y + p2.Y, p1.Z + p2.Z);
+	}
+
+	friend Point operator-(const Point & p1, const Point & p2)
+	{
+		return Point(p1.X - p2.X, p1.Y - p2.Y, p1.Z - p2.Z);
+	}
+
+	friend Point operator*(const Point & p1, const double & a)
+	{
+		return Point(p1.X * a, p1.Y * a, p1.Z * a);
+	}
+
+	friend Point operator*(const double & a, const Point & p1)
+	{
+		return operator*(a, p1);
+	}
+
+	friend Point operator/(const Point & p1, const double & a)
+	{
+		return Point(p1.X / a, p1.Y / a, p1.Z / a);
+	}
+
+	friend double Distance(const Point & p1, const Point & p2)
+	{
+		return sqrt((p1.X - p2.X) * (p1.X - p2.X) + (p1.Y - p2.Y) * (p1.Y - p2.Y) + (p1.Z - p2.Z) * (p1.Z - p2.Z));
+	}
+};
+
+class KMeansCPU
+{
+	Point* points;
+	int* clusters;
+	int* clusterCounts;
+	Point* result;
+	int size;
+	int k;
+public:
+	KMeansCPU(Point* points, int size, int k) : size(size), k(k)
+	{
+		this->points = new Point[size];
+		this->clusters = new int[size];
+
+		for (int i = 0; i < size; i++)
+		{
+			this->points[i] = points[i];
+		}
+
+		this->result = new Point[k];
+		this->clusterCounts = new int[k];
+	}
+	~KMeansCPU()
+	{
+		delete[] points;
+		delete[] result;
+	}
+
+	Point* GetResult()
+	{
+		Point* resultCopy = new Point[k];
+		for (int i = 0; i < k; i++)
+		{
+			resultCopy[i] = result[i];
+		}
+
+		return resultCopy;
+	}
+	void Solve()
+	{
+		if (k > size)
+			return;
+
+		for (int i = 0; i < size; i++)
+		{
+			clusters[i] = -1;
+		}
+
+		for (int i = 0; i < k; i++)
+		{
+			result[i] = points[i];
+			clusters[i] = i;
+		}
+
+		int iteration = 0;
+		int delta;
+		do
+		{
+			for (int i = 0; i < k; i++)
+			{
+				clusterCounts[i] = 0;
+			}
+
+			delta = 0;
+			for (int i = 0; i < size; i++)
+			{
+				double minDist = DBL_MAX;
+				int bestCluster = -1;
+
+				for (int j = 0; j < k; j++)
+				{
+					int dist = Distance(points[i], result[j]);
+					if (dist < minDist)
+					{
+						minDist = dist;
+						bestCluster = j;
+					}
+				}
+
+				if (bestCluster != clusters[i])
+				{
+					clusters[i] = bestCluster;
+					delta++;
+				}
+				clusterCounts[bestCluster]++;
+			}
+
+			Point* newResult = new Point[k];
+
+			for (int i = 0; i < size; i++)
+			{
+				int cluster = clusters[i];
+				newResult[cluster] = newResult[cluster] + points[i];
+			}
+
+			for (int i = 0; i < k; i++)
+			{
+				if (clusterCounts[i] == 0)
+				{
+					continue;
+				}
+				newResult[i] = newResult[i] / clusterCounts[i];
+			}
+			delete[] result;
+			result = newResult;
+
+			printf("Iteration: %d, delta: %d\n", iteration++, delta);
+		} while (delta > 0);
+	}
+};
 
 struct SumPoints: public thrust::binary_function<Point, Point, Point>
 {
@@ -156,7 +312,7 @@ int main()
 
 cudaError_t SolveGPU(Point* h_points, int size, int k)
 {
-	cudaError_t cudaStatus;
+	cudaError_t cudaStatus = cudaSuccess;
 #ifdef TIMERS
 	std::clock_t c_start, c_end;
 	double time_elapsed_ms;
@@ -200,97 +356,97 @@ cudaError_t SolveGPU(Point* h_points, int size, int k)
 	cudaStatus = cudaMalloc((void**)&d_points, size * sizeof(Point));
 	if (cudaStatus != cudaSuccess) {
 	    fprintf(stderr, "cudaMalloc failed!");
-	    goto Error;
+	    goto ErrorStart;
 	}
 
 	cudaStatus = cudaMemcpy(d_points, h_points, size * sizeof(Point), cudaMemcpyHostToDevice);
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "cudaMemcpy failed!");
-		goto Error;
+		goto Error0;
 	}
 
 	cudaStatus = cudaMalloc((void**)&d_clusters, size * sizeof(int));
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "cudaMalloc failed!");
-		goto Error;
-	}
-
-	cudaStatus = cudaMalloc((void**)&d_clusters_copy, size * sizeof(int));
-	if (cudaStatus != cudaSuccess) {
-		fprintf(stderr, "cudaMalloc failed!");
-		goto Error;
+		goto Error0;
 	}
 
 	cudaStatus = cudaMemcpy(d_clusters, h_clusters, size * sizeof(int), cudaMemcpyHostToDevice);
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "cudaMemcpy failed!");
-		goto Error;
+		goto Error1;
+	}
+
+	cudaStatus = cudaMalloc((void**)&d_clusters_copy, size * sizeof(int));
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMalloc failed!");
+		goto Error1;
 	}
 
 	cudaStatus = cudaMalloc((void**)&d_result, k * sizeof(Point));
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "cudaMalloc failed!");
-		goto Error;
+		goto Error2;
 	}
 
 	cudaStatus = cudaMemcpy(d_result, h_result, k * sizeof(Point), cudaMemcpyHostToDevice);
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "cudaMemcpy failed!");
-		goto Error;
+		goto Error3;
 	}
 
 	cudaStatus = cudaMalloc((void**)&d_k, sizeof(int));
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "cudaMalloc failed!");
-		goto Error;
+		goto Error3;
 	}
 
 	cudaStatus = cudaMemcpy(d_k, &k, sizeof(int), cudaMemcpyHostToDevice);
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "cudaMemcpy failed!");
-		goto Error;
+		goto Error4;
 	}
 
 	cudaStatus = cudaMalloc((void**)&d_size, sizeof(int));
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "cudaMalloc failed!");
-		goto Error;
+		goto Error4;
 	}
 
 	cudaStatus = cudaMemcpy(d_size, &size, sizeof(int), cudaMemcpyHostToDevice);
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "cudaMemcpy failed!");
-		goto Error;
+		goto Error5;
 	}
 
 	cudaStatus = cudaMalloc((void**)&d_delta, size * sizeof(int));
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "cudaMalloc failed!");
-		goto Error;
+		goto Error5;
 	}
 
 	cudaStatus = cudaMalloc((void**)&d_new_result, nThreads * nBlocks * k * sizeof(Point));
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "cudaMalloc failed!");
-		goto Error;
+		goto Error6;
 	}
 
 	cudaStatus = cudaMalloc((void**)&d_new_result_final, k * sizeof(Point));
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "cudaMalloc failed!");
-		goto Error;
+		goto Error7;
 	}
 
 	cudaStatus = cudaMalloc((void**)&d_counts, nThreads * nBlocks * k * sizeof(int));
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "cudaMalloc failed!");
-		goto Error;
+		goto Error8;
 	}
 
 	cudaStatus = cudaMalloc((void**)&d_counts_final, k * sizeof(int));
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "cudaMalloc failed!");
-		goto Error;
+		goto Error9;
 	}
 
 	while (true)
@@ -394,11 +550,31 @@ cudaError_t SolveGPU(Point* h_points, int size, int k)
 		std::cout << h_result[i] << std::endl;
 	}
 Error:
+	cudaFree(d_counts_final);
+Error9:
+	cudaFree(d_counts);
+Error8:
+	cudaFree(d_new_result_final);
+Error7:
+	cudaFree(d_new_result);
+Error6:
+	cudaFree(d_delta);
+Error5:
+	cudaFree(d_size);
+Error4:
+	cudaFree(d_k);
+Error3:
+	cudaFree(d_result);
+Error2:
+	cudaFree(d_clusters_copy);
+Error1:
+	cudaFree(d_clusters);
+Error0:
+	cudaFree(d_points);
+
+ErrorStart:
 	delete[] h_clusters;
 	delete[] h_result;
-	cudaFree(d_points);
-	cudaFree(d_clusters);
-	cudaFree(d_result);
 
-	return cudaSuccess;
+	return cudaStatus;
 }
